@@ -1,6 +1,6 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -27,6 +27,9 @@ pub fn get_context_filenames() -> Vec<String> {
 #[derive(Default)]
 pub struct SubdirectoryHintTracker {
     loaded_dirs: HashSet<PathBuf>,
+    loaded_sources: HashMap<String, String>,
+    checked_sources: HashSet<String>,
+    announced_sources: HashMap<PathBuf, Vec<HintSource>>,
     pending_dirs: Vec<PathBuf>,
     hints_filenames: Vec<String>,
 }
@@ -35,6 +38,9 @@ impl SubdirectoryHintTracker {
     pub fn new() -> Self {
         Self {
             loaded_dirs: HashSet::new(),
+            loaded_sources: HashMap::new(),
+            checked_sources: HashSet::new(),
+            announced_sources: HashMap::new(),
             pending_dirs: Vec::new(),
             hints_filenames: get_context_filenames(),
         }
@@ -95,9 +101,14 @@ impl SubdirectoryHintTracker {
             if self.loaded_dirs.contains(&dir) {
                 continue;
             }
-            if let Some(content) =
-                load_hints_from_directory(&dir, &working_dir, &self.hints_filenames)
-            {
+            if let Some((content, sources)) = load_hints_from_directory(
+                &dir,
+                &working_dir,
+                &self.hints_filenames,
+                &mut self.loaded_sources,
+                &mut self.checked_sources,
+            ) {
+                self.announced_sources.insert(dir.clone(), sources);
                 results.push((dir.clone(), content));
             }
             self.loaded_dirs.insert(dir);
@@ -108,16 +119,45 @@ impl SubdirectoryHintTracker {
 
 const HINT_CARRIER_OPERATION: &str = "subdir_hints";
 const HINT_CARRIER_DIR_NOTE: &str = "dir";
+const HINT_CARRIER_SOURCES_NOTE: &str = "sources";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct HintSource {
+    source_id: String,
+    content_id: String,
+}
 
 /// Agent-only messages announcing hints from subdirectories that tool calls
 /// touched and no agent-visible carrier has announced yet.
 pub fn pending_hint_carriers(messages: &[Message], working_dir: &Path) -> Vec<Message> {
     let mut tracker = SubdirectoryHintTracker::new();
+    let (_, system_sources) = load_hint_files_with_sources(
+        working_dir,
+        &tracker.hints_filenames,
+        &build_gitignore(working_dir),
+    );
+    tracker.loaded_sources = system_sources;
     for message in messages {
-        if message.is_agent_visible() {
-            if let Some(dir) = hint_carrier_dir(message) {
-                tracker.mark_loaded(dir);
+        if let Some(dir) = hint_carrier_dir(message) {
+            if message.is_agent_visible() {
+                let sources = message
+                    .metadata
+                    .operation_note(HINT_CARRIER_OPERATION, HINT_CARRIER_SOURCES_NOTE)
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<HintSource>>(value.clone()).ok()
+                    });
+                if let Some(sources) = sources {
+                    for source in sources {
+                        tracker
+                            .loaded_sources
+                            .insert(source.source_id, source.content_id);
+                    }
+                } else {
+                    tracker.mark_loaded(dir.clone());
+                }
             }
+            // Carriers retain instruction scope even when old tool pairs are summarized away.
+            tracker.pending_dirs.push(dir);
         }
         for content in &message.content {
             if let MessageContent::ToolRequest(request) = content {
@@ -127,10 +167,18 @@ pub fn pending_hint_carriers(messages: &[Message], working_dir: &Path) -> Vec<Me
             }
         }
     }
-    tracker
-        .load_new_hints(working_dir)
+    let discovered = tracker.load_new_hints(working_dir);
+    discovered
         .into_iter()
-        .map(|(dir, content)| hint_carrier(&dir, &content))
+        .map(|(dir, content)| {
+            let mut carrier = hint_carrier(&dir, &content);
+            carrier.metadata.set_operation_note(
+                HINT_CARRIER_OPERATION,
+                HINT_CARRIER_SOURCES_NOTE,
+                serde_json::json!(tracker.announced_sources[&dir]),
+            );
+            carrier
+        })
         .collect()
 }
 
@@ -166,11 +214,38 @@ fn resolve_to_parent_dir(token: &str, working_dir: &Path) -> Option<PathBuf> {
     resolved.parent().map(|d| d.to_path_buf())
 }
 
+fn hint_source_id(path: &Path) -> Option<String> {
+    let source = path.canonicalize().ok()?;
+    // Imports resolve against the containing directory, not a symlink target's parent.
+    let scope = path.parent()?.canonicalize().ok()?;
+    let mut identity = blake3::Hasher::new();
+    identity.update(source.as_os_str().as_encoded_bytes());
+    identity.update(&[0]);
+    identity.update(scope.as_os_str().as_encoded_bytes());
+    Some(identity.finalize().to_hex().to_string())
+}
+
+fn global_hint_paths(hints_filenames: &[String]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = hints_filenames
+        .iter()
+        .map(|name| Paths::in_config_dir(name))
+        .collect();
+    if hints_filenames
+        .iter()
+        .any(|name| name == AGENTS_MD_FILENAME)
+    {
+        paths.push(Paths::in_agents_home_dir(AGENTS_MD_FILENAME));
+    }
+    paths
+}
+
 fn load_hints_from_directory(
     directory: &Path,
     working_dir: &Path,
     hints_filenames: &[String],
-) -> Option<String> {
+    loaded_sources: &mut HashMap<String, String>,
+    checked_sources: &mut HashSet<String>,
+) -> Option<(String, Vec<HintSource>)> {
     if !directory.is_dir() || !directory.is_absolute() {
         return None;
     }
@@ -191,10 +266,17 @@ fn load_hints_from_directory(
     directories.reverse();
 
     let mut contents = Vec::new();
+    let mut sources = Vec::new();
     for dir in &directories {
         for hints_filename in hints_filenames {
             let hints_path = dir.join(hints_filename);
             if hints_path.is_file() {
+                let Some(source_id) = hint_source_id(&hints_path) else {
+                    continue;
+                };
+                if !checked_sources.insert(source_id.clone()) {
+                    continue;
+                }
                 let mut visited = HashSet::new();
                 let expanded = read_referenced_files(
                     &hints_path,
@@ -204,7 +286,20 @@ fn load_hints_from_directory(
                     &gitignore,
                 );
                 if !expanded.is_empty() {
-                    contents.push(expanded);
+                    let source = HintSource {
+                        source_id,
+                        content_id: blake3::hash(expanded.as_bytes()).to_hex().to_string(),
+                    };
+                    if loaded_sources.get(&source.source_id) == Some(&source.content_id) {
+                        continue;
+                    }
+                    loaded_sources.insert(source.source_id.clone(), source.content_id.clone());
+                    sources.push(source);
+                    contents.push(format!(
+                        "### Subdirectory Hints ({})\n{}",
+                        dir.display(),
+                        expanded
+                    ));
                 }
             }
         }
@@ -213,11 +308,7 @@ fn load_hints_from_directory(
     if contents.is_empty() {
         None
     } else {
-        Some(format!(
-            "### Subdirectory Hints ({})\n{}",
-            directory.display(),
-            contents.join("\n")
-        ))
+        Some((contents.join("\n"), sources))
     }
 }
 
@@ -288,19 +379,18 @@ pub fn load_hint_files(
     hints_filenames: &[String],
     ignore_patterns: &Gitignore,
 ) -> String {
+    load_hint_files_with_sources(cwd, hints_filenames, ignore_patterns).0
+}
+
+fn load_hint_files_with_sources(
+    cwd: &Path,
+    hints_filenames: &[String],
+    ignore_patterns: &Gitignore,
+) -> (String, HashMap<String, String>) {
     let mut global_hints_contents = Vec::with_capacity(hints_filenames.len());
     let mut local_hints_contents = Vec::with_capacity(hints_filenames.len());
-
-    let mut global_hints_paths: Vec<PathBuf> = hints_filenames
-        .iter()
-        .map(|name| Paths::in_config_dir(name))
-        .collect();
-    if hints_filenames
-        .iter()
-        .any(|name| name == AGENTS_MD_FILENAME)
-    {
-        global_hints_paths.push(Paths::in_agents_home_dir(AGENTS_MD_FILENAME));
-    }
+    let mut loaded_sources = HashMap::new();
+    let global_hints_paths = global_hint_paths(hints_filenames);
 
     for global_hints_path in &global_hints_paths {
         if global_hints_path.is_file() {
@@ -317,6 +407,9 @@ pub fn load_hint_files(
                 &global_ignore_patterns,
             );
             if !expanded_content.is_empty() {
+                if !record_hint_version(global_hints_path, &expanded_content, &mut loaded_sources) {
+                    continue;
+                }
                 global_hints_contents.push(expanded_content);
             }
         }
@@ -339,6 +432,9 @@ pub fn load_hint_files(
                     ignore_patterns,
                 );
                 if !expanded_content.is_empty() {
+                    if !record_hint_version(&hints_path, &expanded_content, &mut loaded_sources) {
+                        continue;
+                    }
                     local_hints_contents.push(expanded_content);
                 }
             }
@@ -361,8 +457,27 @@ pub fn load_hint_files(
         hints.push_str(&local_hints_contents.join("\n"));
     }
 
-    hints
+    (hints, loaded_sources)
 }
+
+fn record_hint_version(
+    path: &Path,
+    expanded_content: &str,
+    loaded_sources: &mut HashMap<String, String>,
+) -> bool {
+    let Some(source_id) = hint_source_id(path) else {
+        return true;
+    };
+    let content_id = blake3::hash(expanded_content.as_bytes())
+        .to_hex()
+        .to_string();
+    // The same source can expand differently under global and project import boundaries.
+    loaded_sources.insert(source_id, content_id.clone()) != Some(content_id)
+}
+
+#[cfg(test)]
+#[path = "qualification_tests.rs"]
+mod qualification_tests;
 
 #[cfg(test)]
 mod tests {
